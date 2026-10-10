@@ -189,6 +189,64 @@ static void draw_separator(i3_output *output, uint32_t x, struct status_block *b
     }
 }
 
+/*
+ * Returns true if and only if the block has an image to render. The image is
+ * drawn behind the text: the text remains visible unless the block is
+ * shortened, in which case its short_text is rendered without the image.
+ *
+ */
+static bool block_has_image(struct status_block *block) {
+    if (block->image == NULL || (block->use_short && block->short_text != NULL)) {
+        return false;
+    }
+    /* Be defensive about degenerate images: they would be scaled to nothing,
+     * which is not something cairo can render. */
+    return cairo_image_surface_get_width(block->image) > 0 &&
+           cairo_image_surface_get_height(block->image) > 0;
+}
+
+/*
+ * Returns the height of the box an image is scaled into to fit the bar.
+ *
+ */
+static int image_box_height(void) {
+    return MAX(bar_height - 2 * logical_px(1), 1);
+}
+
+/*
+ * Returns the width an image occupies when scaled to image_box_height() while
+ * keeping its aspect ratio.
+ *
+ */
+static uint32_t predict_image_width(cairo_surface_t *image) {
+    const int width = cairo_image_surface_get_width(image);
+    const int height = cairo_image_surface_get_height(image);
+    if (width <= 0 || height <= 0) {
+        return 0;
+    }
+    /* Clamp to at least one pixel. draw_statusline() scales the image into a
+     * box of exactly this width, and a zero-width box would make
+     * draw_util_image() call cairo_scale() with a scale of 0. That poisons the
+     * statusline's cairo context with CAIRO_STATUS_INVALID_MATRIX, which is
+     * sticky and silently disables all further drawing on the bar. */
+    const uint32_t scaled_width = (uint32_t)((int64_t)width * image_box_height() / height);
+    return MAX(scaled_width, 1u);
+}
+
+/*
+ * draw_util_image() scales an image to fit the given box while preserving its
+ * aspect ratio and draws it aligned to the top left of that box. This function
+ * returns the height the image will actually be drawn at, which is needed to
+ * center it vertically within the bar.
+ *
+ */
+static int image_drawn_height(cairo_surface_t *image, int box_width, int box_height) {
+    const int src_width = MAX(cairo_image_surface_get_width(image), 1);
+    const int src_height = MAX(cairo_image_surface_get_height(image), 1);
+    const double scale = MIN((double)box_width / src_width, (double)box_height / src_height);
+    return (int)(src_height * scale);
+}
+
 static void predict_block_length(struct status_block *block) {
     i3String *text = block->full_text;
     struct status_block_render_desc *render = &block->full_render;
@@ -197,12 +255,19 @@ static void predict_block_length(struct status_block *block) {
         render = &block->short_render;
     }
 
-    if (i3string_get_num_bytes(text) == 0) {
+    const bool has_image = block_has_image(block);
+    const bool has_text = i3string_get_num_bytes(text) > 0;
+
+    if (!has_image && !has_text) {
         block->render_length = 0;
         return;
     }
 
-    render->width = predict_text_width(text);
+    render->width = has_text ? (uint32_t)predict_text_width(text) : 0;
+    if (has_image) {
+        render->width = MAX(render->width, predict_image_width(block->image));
+    }
+
     if (block->border) {
         render->width += logical_px(block->border_left + block->border_right);
     }
@@ -317,7 +382,10 @@ static void draw_statusline(i3_output *output, uint32_t clip_left, bool use_focu
             render = &block->short_render;
         }
 
-        if (i3string_get_num_bytes(text) == 0) {
+        const bool has_image = block_has_image(block);
+        const bool has_text = i3string_get_num_bytes(text) > 0;
+
+        if (!has_image && !has_text) {
             continue;
         }
 
@@ -365,10 +433,24 @@ static void draw_statusline(i3_output *output, uint32_t clip_left, bool use_focu
                                 bar_height - has_border * logical_px(block->border_bottom + block->border_top) - logical_px(2));
         }
 
-        draw_util_text(text, &output->statusline_buffer, fg_color, bg_color,
-                       x + render->x_offset + has_border * logical_px(block->border_left),
-                       bar_height / 2 - font.height / 2,
-                       render->width - has_border * logical_px(block->border_left + block->border_right));
+        if (has_image) {
+            const int image_width = render->width - has_border * logical_px(block->border_left + block->border_right);
+            const int box_height = image_box_height();
+            /* Center the image vertically, as draw_util_image() aligns it to the
+             * top of the box it is drawn into. */
+            const int drawn_height = image_drawn_height(block->image, image_width, box_height);
+            draw_util_image(block->image, &output->statusline_buffer,
+                            x + render->x_offset + has_border * logical_px(block->border_left),
+                            (bar_height - drawn_height) / 2,
+                            image_width,
+                            box_height);
+        }
+        if (has_text) {
+            draw_util_text(text, &output->statusline_buffer, fg_color, bg_color,
+                           x + render->x_offset + has_border * logical_px(block->border_left),
+                           bar_height / 2 - font.height / 2,
+                           render->width - has_border * logical_px(block->border_left + block->border_right));
+        }
         x += full_render_width;
 
         /* If this is not the last block, draw a separator. */
@@ -525,7 +607,7 @@ static void child_handle_button(xcb_button_press_event_t *event, i3_output *outp
             render = &block->full_render;
         }
 
-        if (i3string_get_num_bytes(text) == 0) {
+        if (i3string_get_num_bytes(text) == 0 && !block_has_image(block)) {
             continue;
         }
 
